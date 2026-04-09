@@ -2,8 +2,8 @@
 # Build portable macOS app with MLX bundled
 
 [[runtimes]]
-name = "cpython-3.11"
-python_implementation = "cpython@3.11.10"
+name = "cpython-3.12"
+python_implementation = "cpython@3.12.8"
 requirements = []
 platforms = [
     "macosx_arm64",
@@ -11,7 +11,7 @@ platforms = [
 
 [[frameworks]]
 name = "mlx-framework"
-runtime = "cpython-3.11"
+runtime = "cpython-3.12"
 requirements = [
     # Core MLX
     "mlx==0.31.1",
@@ -99,6 +99,8 @@ requirements = [
     # PyObjC for native macOS menubar app
     "pyobjc-core>=10.0",
     "pyobjc-framework-Cocoa>=10.0",
+    # Grammar-constrained decoding for structured output
+    "xgrammar>=0.1.32",
 ]
 platforms = [
     "macosx_arm64",

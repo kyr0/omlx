@@ -33,6 +33,32 @@ WHEELS_DIR = SCRIPT_DIR / "_wheels"
 APP_NAME = "oMLX"
 APP_BUNDLE = f"{APP_NAME}.app"
 
+# Waldwicht repo layout: omlx/ sits inside a parent repo that also
+# contains mlx/ and mlx-lm/ source checkouts.  When detected, the
+# packaging build uses those local forks instead of upstream PyPI /
+# git-pinned packages.
+WALDWICHT_ROOT = SCRIPT_DIR.parent.parent
+
+
+def _detect_local_forks() -> dict[str, Path]:
+    """Detect local mlx/mlx-lm source checkouts in waldwicht repo layout.
+
+    Returns a dict of {package_name: source_path} for each fork found.
+    """
+    candidates = {
+        "mlx": WALDWICHT_ROOT / "mlx",
+        "mlx-lm": WALDWICHT_ROOT / "mlx-lm",
+    }
+    found = {}
+    for name, path in candidates.items():
+        if path.is_dir() and (
+            (path / "setup.py").exists() or (path / "pyproject.toml").exists()
+        ):
+            found[name] = path
+    if found:
+        print(f"  Waldwicht layout detected — local forks: {list(found.keys())}")
+    return found
+
 
 def _read_version() -> str:
     """Read version from omlx/_version.py (single source of truth)."""
@@ -136,7 +162,7 @@ def _resolve_mlx_version(toml_path: Path) -> str:
 
 
 def swap_platform_wheels(
-    export_dir: Path, macos_target: str, python_version: str = "3.11"
+    export_dir: Path, macos_target: str, python_version: str = "3.12"
 ):
     """Replace mlx and mlx-metal in exported venvstacks with platform-specific wheels.
 
@@ -234,7 +260,7 @@ def _find_target_python() -> str:
     """Find a Python interpreter matching the venvstacks target version.
 
     Sdist-only packages may compile C extensions, so the wheel must be built
-    with the same Python version that venvstacks targets (e.g. 3.11).
+    with the same Python version that venvstacks targets (e.g. 3.12).
     Falls back to sys.executable if no matching version is found.
     """
     toml_path = SCRIPT_DIR / "venvstacks.toml"
@@ -243,7 +269,7 @@ def _find_target_python() -> str:
     if not match:
         return sys.executable
 
-    target_minor = match.group(1)  # e.g. "3.11"
+    target_minor = match.group(1)  # e.g. "3.12"
     candidates = [
         shutil.which(f"python{target_minor}"),
         str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
@@ -260,9 +286,29 @@ def _build_sdist_wheel(pkg_name: str) -> bool:
     """Build a wheel for a sdist-only package into _wheels/.
 
     Uses the target Python version so C extensions get the correct ABI tag.
+    Falls back to sys.executable if the target Python lacks pip.
     Returns True if the wheel was built successfully.
     """
     target_python = _find_target_python()
+    # Ensure target python has pip; bootstrap via ensurepip if needed
+    pip_check = subprocess.run(
+        [target_python, "-m", "pip", "--version"],
+        capture_output=True,
+    )
+    if pip_check.returncode != 0:
+        print(f"  Bootstrapping pip into {target_python} via ensurepip...")
+        subprocess.run(
+            [target_python, "-m", "ensurepip"],
+            capture_output=True,
+        )
+        # Re-check
+        pip_check2 = subprocess.run(
+            [target_python, "-m", "pip", "--version"],
+            capture_output=True,
+        )
+        if pip_check2.returncode != 0:
+            print(f"  Warning: {target_python} still has no pip, using {sys.executable}")
+            target_python = sys.executable
     print(f"  Building wheel for {pkg_name} (sdist-only, using {target_python})...")
     result = subprocess.run(
         [target_python, "-m", "pip", "wheel", pkg_name, "--no-deps",
@@ -272,14 +318,81 @@ def _build_sdist_wheel(pkg_name: str) -> bool:
     return result.returncode == 0
 
 
+def _sanitize_wheel_metadata(wheels_dir: Path):
+    """Rewrite wheel METADATA to remove file:// URLs and relax local-fork pins.
+
+    When pip builds a wheel from an editable install, it bakes `file://`
+    URLs into Requires-Dist (e.g. "mlx @ file:///path/to/mlx").  Similarly,
+    other wheels may pin versions (e.g. "mlx>=0.31.1") that conflict with
+    the local fork version.  This rewrites affected Requires-Dist lines
+    to unconditional dependency names (no version constraint), so the
+    uv resolver accepts whatever version is provided via --find-links.
+    """
+    import zipfile
+
+    local_forks = _detect_local_forks()
+    fork_names = {n.lower().replace("-", "_") for n in local_forks}
+    if not fork_names:
+        return
+
+    for whl in wheels_dir.glob("*.whl"):
+        needs_fix = False
+        meta_name = None
+        with zipfile.ZipFile(whl, "r") as z:
+            for name in z.namelist():
+                if name.endswith("/METADATA"):
+                    raw = z.read(name).decode()
+                    for line in raw.splitlines():
+                        if not line.startswith("Requires-Dist:"):
+                            continue
+                        # Extract the package name from the Requires-Dist line
+                        dep = line.split(":")[1].strip().split()[0].split("@")[0].split("[")[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].strip()
+                        dep_normalized = dep.lower().replace("-", "_")
+                        if dep_normalized in fork_names and ("file:///" in line or ">" in line or "<" in line or "=" in line.split(":", 1)[1].split(";")[0]):
+                            needs_fix = True
+                            meta_name = name
+                            break
+                    if not needs_fix:
+                        meta_name = None
+                    break
+
+        if not needs_fix or not meta_name:
+            continue
+
+        print(f"  Sanitizing {whl.name} (relaxing local-fork dep constraints)")
+        tmp = whl.with_suffix(".tmp")
+        with zipfile.ZipFile(whl, "r") as zin, zipfile.ZipFile(tmp, "w") as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == meta_name:
+                    lines = data.decode().splitlines(keepends=True)
+                    new_lines = []
+                    for line in lines:
+                        if line.startswith("Requires-Dist:"):
+                            dep = line.split(":")[1].strip().split()[0].split("@")[0].split("[")[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].strip()
+                            dep_normalized = dep.lower().replace("-", "_")
+                            if dep_normalized in fork_names:
+                                # Keep extras and markers, strip version/URL
+                                # "Requires-Dist: mlx (>=0.31.1) ; extra == 'gpu'" → "Requires-Dist: mlx ; extra == 'gpu'"
+                                parts = line.split(";", 1)
+                                marker = f" ;{parts[1]}" if len(parts) > 1 else "\n"
+                                new_lines.append(f"Requires-Dist: {dep}{marker}")
+                                continue
+                        new_lines.append(line)
+                    data = "".join(new_lines).encode()
+                zout.writestr(item, data)
+        tmp.replace(whl)
+
+
 def build_local_wheels():
-    """Pre-build wheels for git-pinned packages.
+    """Pre-build wheels for git-pinned packages (and local forks when available).
 
     venvstacks/uv disables source builds (--only-binary :all:), so git-pinned
     packages must be pre-built as wheels. This function:
     1. Parses git URLs from venvstacks.toml
-    2. Builds wheels via pip
-    3. Returns a mapping of package_name -> version for toml rewriting
+    2. Detects local mlx/mlx-lm forks (waldwicht layout)
+    3. Builds wheels via pip (local forks take priority over git URLs)
+    4. Returns a mapping of package_name -> version for toml rewriting
 
     Sdist-only dependencies (packages with no pre-built wheel on PyPI) are
     handled separately by _lock_with_sdist_retry() during the lock step.
@@ -288,15 +401,24 @@ def build_local_wheels():
 
     toml_path = SCRIPT_DIR / "venvstacks.toml"
     git_reqs = _parse_git_requirements(toml_path)
+    local_forks = _detect_local_forks()
+
+    # Normalized names of packages with local forks
+    local_fork_normalized = {
+        name.lower().replace("-", "_") for name in local_forks
+    }
 
     # Clean and recreate wheels dir for fresh builds
     if WHEELS_DIR.exists():
         shutil.rmtree(WHEELS_DIR)
     WHEELS_DIR.mkdir(parents=True)
 
-    # Build wheels from git-pinned packages
+    # Build wheels from git-pinned packages (skip those with local forks)
     for full_req, git_url in git_reqs:
         pkg_name = full_req.split("@")[0].strip()
+        if pkg_name.lower().replace("-", "_") in local_fork_normalized:
+            print(f"  Skipping {pkg_name} git build (using local fork)")
+            continue
         print(f"  Building wheel for {pkg_name} ...")
         run_cmd([
             sys.executable, "-m", "pip", "wheel",
@@ -305,17 +427,34 @@ def build_local_wheels():
             "-w", str(WHEELS_DIR),
         ])
 
-    # Build version mapping from git-pinned wheels only
-    # (used for rewriting venvstacks.toml git URLs to local file:// paths)
-    git_pkg_names = {
+    # Build wheels from local forks
+    if local_forks:
+        for name, path in local_forks.items():
+            print(f"  Building wheel for {name} from {path} ...")
+            env = os.environ.copy()
+            if name == "mlx":
+                env["PYPI_RELEASE"] = "1"  # required by the mlx fork build
+            subprocess.run(
+                [sys.executable, "-m", "pip", "wheel",
+                 str(path), "--no-deps", "-w", str(WHEELS_DIR)],
+                env=env, check=True,
+            )
+
+    # Sanitize all wheels: remove file:// URLs and relax version pins
+    # for packages that have local forks (prevents uv resolver conflicts)
+    _sanitize_wheel_metadata(WHEELS_DIR)
+
+    # Build version mapping from all managed wheels
+    # (git-pinned + local forks, used for rewriting venvstacks.toml)
+    tracked_names = {
         full_req.split("@")[0].strip().lower().replace("-", "_")
         for full_req, _ in git_reqs
-    }
+    } | local_fork_normalized
     version_map = {}
     for whl in WHEELS_DIR.glob("*.whl"):
         name = _wheel_pkg_name(whl)
         version = _wheel_version(whl)
-        if name.replace("-", "_") in git_pkg_names:
+        if name.replace("-", "_") in tracked_names:
             version_map[name] = version
         print(f"    {name} == {version}")
 
@@ -392,13 +531,14 @@ def _find_wheel_for_package(pkg_name: str) -> Path | None:
 def _write_engine_commits(omlx_pkg_dir: Path):
     """Write _engine_commits.json to the omlx package for runtime SHA display.
 
-    Extracts commit SHAs from venvstacks.toml git URLs and writes them
+    Extracts commit SHAs from venvstacks.toml git URLs (and local fork HEADs)
     so _get_engine_info() can show clickable commit links in the admin dashboard.
     """
     import json
 
     toml_path = SCRIPT_DIR / "venvstacks.toml"
     git_reqs = _parse_git_requirements(toml_path)
+    local_forks = _detect_local_forks()
 
     repo_urls = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
@@ -407,9 +547,9 @@ def _write_engine_commits(omlx_pkg_dir: Path):
     }
 
     commits = {}
+    # Git-pinned packages
     for full_req, git_url in git_reqs:
         pkg_name = full_req.split("@")[0].strip().lower()
-        # git_url format: git+https://github.com/ml-explore/mlx-lm@bcf6306...
         if "@" in git_url:
             commit = git_url.rsplit("@", 1)[1]
             if pkg_name in repo_urls:
@@ -417,6 +557,22 @@ def _write_engine_commits(omlx_pkg_dir: Path):
                     "commit": commit,
                     "url": repo_urls[pkg_name],
                 }
+
+    # Local forks — read git HEAD for provenance tracking
+    for name, path in local_forks.items():
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=path, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                commit = result.stdout.strip()
+                entry = {"commit": commit, "local_fork": True}
+                if name in repo_urls:
+                    entry["url"] = repo_urls[name]
+                commits[name] = entry
+        except Exception:
+            pass
 
     if commits:
         commits_file = omlx_pkg_dir / "_engine_commits.json"
@@ -429,10 +585,13 @@ def _create_resolved_toml(version_map: dict[str, str]) -> Path:
 
     Git-built wheels have different hashes than PyPI releases of the same version,
     so we must point directly to the local wheel files to avoid hash mismatches.
+    When waldwicht local forks are detected, their version pins (e.g. "mlx==0.31.1")
+    are also rewritten to point to the locally-built wheel.
     """
     toml_path = SCRIPT_DIR / "venvstacks.toml"
     content = toml_path.read_text()
 
+    # Rewrite git URLs → local wheel paths
     for full_req, git_url in _parse_git_requirements(toml_path):
         pkg_name = full_req.split("@")[0].strip()
         whl = _find_wheel_for_package(pkg_name)
@@ -442,6 +601,33 @@ def _create_resolved_toml(version_map: dict[str, str]) -> Path:
             new_line = f'"{pkg_name} @ {whl_uri}"'
             content = content.replace(old_line, new_line)
             print(f"    {pkg_name} @ git+... → {whl.name}")
+
+    # Rewrite version pins for local-fork packages (e.g. "mlx==0.31.1" → file://)
+    local_forks = _detect_local_forks()
+    override_lines = []
+    for name in local_forks:
+        whl = _find_wheel_for_package(name)
+        if whl:
+            whl_uri = whl.resolve().as_uri()
+            whl_ref = f"{name} @ {whl_uri}"
+            # Match version pins like "mlx==0.31.1" or "mlx>=0.31.1"
+            pin_pattern = rf'"({re.escape(name)}\s*[><=!][^"]*)"'
+            match = re.search(pin_pattern, content)
+            if match:
+                old_pin = f'"{match.group(1)}"'
+                new_pin = f'"{whl_ref}"'
+                content = content.replace(old_pin, new_pin)
+                print(f"    {match.group(1)} → {whl.name}")
+            # Add override so transitive deps accept this version
+            override_lines.append(f'    "{whl_ref}",')
+
+    # Inject override-dependencies for local forks into [tool.uv]
+    if override_lines:
+        overrides_block = "override-dependencies = [\n" + "\n".join(override_lines) + "\n]\n"
+        if "[tool.uv]" in content:
+            content = content.replace("[tool.uv]", f"[tool.uv]\n{overrides_block}")
+        else:
+            content += f"\n[tool.uv]\n{overrides_block}"
 
     resolved_path = SCRIPT_DIR / "_venvstacks_resolved.toml"
     resolved_path.write_text(content)
@@ -453,9 +639,12 @@ def _check_git_commit_sync():
 
     Aborts the build if any git-pinned package has different commits
     in the two files, preventing accidental stale builds.
+    Skips packages that have local forks (those are built from source).
     """
     pyproject_path = SCRIPT_DIR.parent / "pyproject.toml"
     venvstacks_path = SCRIPT_DIR / "venvstacks.toml"
+    local_forks = _detect_local_forks()
+    local_fork_names = {n.lower() for n in local_forks}
 
     pyproject_reqs = {
         r[0].split("@")[0].strip().lower(): r[1]
@@ -468,6 +657,8 @@ def _check_git_commit_sync():
 
     mismatches = []
     for pkg in pyproject_reqs:
+        if pkg in local_fork_names:
+            continue
         if pkg in venvstacks_reqs and pyproject_reqs[pkg] != venvstacks_reqs[pkg]:
             mismatches.append(
                 f"  {pkg}:\n"
@@ -583,7 +774,7 @@ def _install_mlx_audio(export_dir: Path):
         export_dir
         / "framework-mlx-framework"
         / "lib"
-        / "python3.11"
+        / "python3.12"
         / "site-packages"
     )
     if not fw_site.exists():
@@ -620,7 +811,7 @@ def _install_spacy_model(export_dir: Path):
         export_dir
         / "framework-mlx-framework"
         / "lib"
-        / "python3.11"
+        / "python3.12"
         / "site-packages"
     )
     if not fw_site.exists():
@@ -670,7 +861,7 @@ def _strip_unused_packages(export_dir: Path):
         export_dir
         / "framework-mlx-framework"
         / "lib"
-        / "python3.11"
+        / "python3.12"
         / "site-packages"
     )
     if not fw_site.exists():
@@ -712,7 +903,7 @@ def _create_c_launcher(macos_dir: Path, app_name: str):
     The launcher:
     - Detects both Python/ (release) and Frameworks/ (dev) directories
     - Sets PYTHONHOME, PYTHONPATH, PYTHONDONTWRITEBYTECODE
-    - Loads bundled libpython3.11.dylib and calls Py_BytesMain("-m omlx_app")
+    - Loads bundled libpython3.12.dylib and calls Py_BytesMain("-m omlx_app")
     - Shows an error dialog via osascript if startup fails
     """
     launcher_c = macos_dir / "_launcher.c"
@@ -778,14 +969,14 @@ int main(int argc, char *argv[]) {
 
     /* Set PYTHONHOME */
     char pythonhome[PATH_MAX];
-    snprintf(pythonhome, sizeof(pythonhome), "%s/cpython-3.11", layers_dir);
+    snprintf(pythonhome, sizeof(pythonhome), "%s/cpython-3.12", layers_dir);
     setenv("PYTHONHOME", pythonhome, 1);
 
     /* Set PYTHONPATH */
     char pythonpath[PATH_MAX * 4];
     snprintf(pythonpath, sizeof(pythonpath),
-        "%s/Resources:%s/app-omlx-app/lib/python3.11/site-packages:"
-        "%s/framework-mlx-framework/lib/python3.11/site-packages",
+        "%s/Resources:%s/app-omlx-app/lib/python3.12/site-packages:"
+        "%s/framework-mlx-framework/lib/python3.12/site-packages",
         contents_dir, layers_dir, layers_dir);
     setenv("PYTHONPATH", pythonpath, 1);
 
@@ -802,7 +993,7 @@ int main(int argc, char *argv[]) {
 
     /* Load bundled libpython and run -m omlx_app in-process (no exec trampoline). */
     char libpython[PATH_MAX];
-    snprintf(libpython, sizeof(libpython), "%s/lib/libpython3.11.dylib", contents_dir);
+    snprintf(libpython, sizeof(libpython), "%s/lib/libpython3.12.dylib", contents_dir);
     void *py = dlopen(libpython, RTLD_NOW | RTLD_GLOBAL);
     if (!py) {
         char err[1024];
@@ -885,7 +1076,7 @@ def create_app_bundle():
 
     # Copy venvstacks environments to Frameworks
     print("  Copying Python environment...")
-    for layer in ["cpython-3.11", "framework-mlx-framework", "app-omlx-app"]:
+    for layer in ["cpython-3.12", "framework-mlx-framework", "app-omlx-app"]:
         src = EXPORT_DIR / layer
         if src.exists():
             dst = frameworks_dir / layer
@@ -934,17 +1125,17 @@ def create_app_bundle():
 
     # Copy Python binary into MacOS/ so macOS recognizes it as a bundle executable
     print("  Copying Python runtime into MacOS/...")
-    src_python = frameworks_dir / "cpython-3.11" / "bin" / "python3"
+    src_python = frameworks_dir / "cpython-3.12" / "bin" / "python3"
     dst_python = macos_dir / "python3"
     shutil.copy2(src_python, dst_python)
     dst_python.chmod(0o755)
 
-    # Python binary references @executable_path/../lib/libpython3.11.dylib
+    # Python binary references @executable_path/../lib/libpython3.12.dylib
     # Create Contents/lib/ with symlink to the actual dylib in Frameworks
     lib_dir = contents_dir / "lib"
     lib_dir.mkdir(exist_ok=True)
-    (lib_dir / "libpython3.11.dylib").symlink_to(
-        "../Frameworks/cpython-3.11/lib/libpython3.11.dylib"
+    (lib_dir / "libpython3.12.dylib").symlink_to(
+        "../Frameworks/cpython-3.12/lib/libpython3.12.dylib"
     )
 
     # Create compiled C launcher binary
@@ -961,8 +1152,8 @@ def create_app_bundle():
         'CONTENTS="$(dirname "$DIR")"\n'
         'LAYERS="$CONTENTS/Frameworks"\n'
         '[ ! -d "$LAYERS" ] && LAYERS="$CONTENTS/Python"\n'
-        'export PYTHONHOME="$LAYERS/cpython-3.11"\n'
-        'export PYTHONPATH="$CONTENTS/Resources:$LAYERS/app-omlx-app/lib/python3.11/site-packages:$LAYERS/framework-mlx-framework/lib/python3.11/site-packages"\n'
+        'export PYTHONHOME="$LAYERS/cpython-3.12"\n'
+        'export PYTHONPATH="$CONTENTS/Resources:$LAYERS/app-omlx-app/lib/python3.12/site-packages:$LAYERS/framework-mlx-framework/lib/python3.12/site-packages"\n'
         'export PYTHONDONTWRITEBYTECODE=1\n'
         'exec "$DIR/python3" -m omlx.cli "$@"\n'
     )
@@ -1038,7 +1229,7 @@ def create_placeholder_icon(resources_dir: Path):
 
     try:
         # Method 1: Use exported runtime Python with AppKit (native macOS SVG rendering)
-        runtime_python = EXPORT_DIR / "cpython-3.11" / "bin" / "python3"
+        runtime_python = EXPORT_DIR / "cpython-3.12" / "bin" / "python3"
         if runtime_python.exists() and _render_svg_with_appkit(runtime_python, tmp_svg, tmp_png):
             _png_to_icns(str(tmp_png), icon_path, resources_dir)
             print("    Created app icon from SVG (AppKit)")
@@ -1091,8 +1282,8 @@ png_data = rep.representationUsingType_properties_(NSPNGFileType, {{}})
 png_data.writeToFile_atomically_("{png_path}", True)
 '''
     runtime_dir = python_exe.parent.parent
-    app_sp = EXPORT_DIR / "app-omlx-app" / "lib" / "python3.11" / "site-packages"
-    fw_sp = EXPORT_DIR / "framework-mlx-framework" / "lib" / "python3.11" / "site-packages"
+    app_sp = EXPORT_DIR / "app-omlx-app" / "lib" / "python3.12" / "site-packages"
+    fw_sp = EXPORT_DIR / "framework-mlx-framework" / "lib" / "python3.12" / "site-packages"
 
     env = os.environ.copy()
     env["PYTHONHOME"] = str(runtime_dir)
@@ -1166,7 +1357,7 @@ def sign_app(app_dir: Path):
     """Ad-hoc sign the app bundle for development.
 
     Uses --deep to recursively sign subcomponents. This may fail on
-    venvstacks layers (e.g. cpython-3.11 in Frameworks/) because codesign
+    venvstacks layers (e.g. cpython-3.12 in Frameworks/) because codesign
     treats dotted directory names as framework bundles.
 
     If signing fails, the broken _CodeSignature is removed so the app
