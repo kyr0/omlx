@@ -25,8 +25,8 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
     SequenceStateMachine,
-    generation_stream,
 )
+import mlx_lm.generate as _mlx_lm_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
@@ -36,6 +36,41 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
+
+# Flag: has generation_stream been re-created on the executor thread?
+_stream_initialized = False
+
+
+def _ensure_generation_stream():
+    """Initialize MLX GPU context and re-create generation_stream on the
+    current (executor) thread.
+
+    MLX >=0.31.2 enforces thread-local streams: both the default stream and
+    any custom streams must be created on the thread that uses them.  The
+    module-level ``generation_stream`` in mlx_lm.generate is created at
+    import time on the main thread, but all scheduler work runs on the
+    mlx-global executor thread.
+
+    This function:
+    1. Forces MLX to create a default GPU stream for this thread by running
+       a trivial eval (otherwise .item() calls inside BatchGenerator/cache
+       fail with "There is no Stream(gpu, 0) in current thread").
+    2. Re-creates generation_stream on this thread so mx.synchronize() works.
+    """
+    global _stream_initialized
+    if not _stream_initialized:
+        # Step 1: Force default stream initialization on this thread.
+        # Without this, any .item()/.eval() inside BatchGenerator internals
+        # (e.g. cache.filter -> left_padding.min().item()) will fail.
+        mx.eval(mx.zeros(1))
+        # Step 2: Re-create generation_stream on this thread.
+        _mlx_lm_generate.generation_stream = mx.new_stream(mx.default_device())
+        _stream_initialized = True
+
+
+def _get_generation_stream():
+    """Get the (possibly re-created) generation_stream."""
+    return _mlx_lm_generate.generation_stream
 
 
 def _sync_and_clear_cache():
@@ -49,7 +84,7 @@ def _sync_and_clear_cache():
 
     See: https://github.com/jundot/omlx/issues/300
     """
-    mx.synchronize(generation_stream)
+    mx.synchronize(_get_generation_stream())
     mx.synchronize()  # default stream
     mx.clear_cache()
 
@@ -1628,8 +1663,8 @@ class Scheduler:
         try:
             # Synchronize pending generation_stream operations before
             # accessing batch cache tensors.
-            mx.synchronize(generation_stream)
-            with mx.stream(generation_stream):
+            mx.synchronize(_get_generation_stream())
+            with mx.stream(_get_generation_stream()):
                 result = self.batch_generator.extract_cache([uid])
                 if uid not in result:
                     return None
@@ -2536,7 +2571,7 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
-            mx.synchronize(generation_stream)
+            mx.synchronize(_get_generation_stream())
             self._remove_uid_from_active_batch(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
@@ -3227,7 +3262,7 @@ class Scheduler:
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
-            mx.synchronize(generation_stream)
+            mx.synchronize(_get_generation_stream())
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -3267,7 +3302,7 @@ class Scheduler:
                             # Keep all tensor-touching cache store work on the
                             # generation stream to avoid cross-stream conflicts
                             # with arrays extracted from BatchGenerator caches.
-                            with mx.stream(generation_stream):
+                            with mx.stream(_get_generation_stream()):
                                 boundary_override = self._get_boundary_store_override(
                                     request_id,
                                     cacheable_sequence,
@@ -3362,7 +3397,7 @@ class Scheduler:
                 # batch_generator.next() call.  Without this barrier the Metal
                 # driver can hit 'completeMemory() prepare count underflow'.
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
-                mx.synchronize(generation_stream)
+                mx.synchronize(_get_generation_stream())
                 self._remove_uid_from_active_batch(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
@@ -3525,6 +3560,7 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
+        _ensure_generation_stream()
         output = SchedulerOutput()
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)

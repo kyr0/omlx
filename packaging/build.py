@@ -444,6 +444,17 @@ def build_local_wheels():
     # for packages that have local forks (prevents uv resolver conflicts)
     _sanitize_wheel_metadata(WHEELS_DIR)
 
+    # Pre-build wheels for known sdist-only packages.  These have no
+    # pre-built wheel on PyPI, so both `uv pip compile --only-binary` (lock)
+    # and `pip install --only-binary` (venvstacks build) will fail without
+    # a local wheel in _wheels/.
+    SDIST_ONLY_PACKAGES = ["webrtcvad", "docopt"]
+    for pkg in SDIST_ONLY_PACKAGES:
+        if not any(WHEELS_DIR.glob(f"{pkg.replace('-', '_')}*.whl")):
+            print(f"  Pre-building sdist-only wheel for {pkg} ...")
+            if not _build_sdist_wheel(pkg):
+                print(f"  Warning: failed to build wheel for {pkg}, lock may fail")
+
     # Build version mapping from all managed wheels
     # (git-pinned + local forks, used for rewriting venvstacks.toml)
     tracked_names = {
