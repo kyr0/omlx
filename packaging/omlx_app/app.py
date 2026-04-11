@@ -731,7 +731,7 @@ class OMLXAppDelegate(NSObject):
 
         # --- About ---
         about_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "About oMLX", "showAbout:", ""
+            "About oMLX (Waldwicht 0.0.1)", "showAbout:", ""
         )
         about_item.setTarget_(self)
         about_icon = self._create_menu_icon("info.circle")

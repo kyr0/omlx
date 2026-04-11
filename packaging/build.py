@@ -34,20 +34,21 @@ APP_NAME = "oMLX"
 APP_BUNDLE = f"{APP_NAME}.app"
 
 # Waldwicht repo layout: omlx/ sits inside a parent repo that also
-# contains mlx/ and mlx-lm/ source checkouts.  When detected, the
+# contains mlx/, mlx-lm/, and mlx-embeddings/ source checkouts. When detected, the
 # packaging build uses those local forks instead of upstream PyPI /
 # git-pinned packages.
 WALDWICHT_ROOT = SCRIPT_DIR.parent.parent
 
 
 def _detect_local_forks() -> dict[str, Path]:
-    """Detect local mlx/mlx-lm source checkouts in waldwicht repo layout.
+    """Detect local engine source checkouts in waldwicht repo layout.
 
     Returns a dict of {package_name: source_path} for each fork found.
     """
     candidates = {
         "mlx": WALDWICHT_ROOT / "mlx",
         "mlx-lm": WALDWICHT_ROOT / "mlx-lm",
+        "mlx-embeddings": WALDWICHT_ROOT / "mlx-embeddings",
     }
     found = {}
     for name, path in candidates.items():
@@ -417,7 +418,7 @@ def build_local_wheels():
     venvstacks/uv disables source builds (--only-binary :all:), so git-pinned
     packages must be pre-built as wheels. This function:
     1. Parses git URLs from venvstacks.toml
-    2. Detects local mlx/mlx-lm forks (waldwicht layout)
+    2. Detects local mlx/mlx-lm/mlx-embeddings forks (waldwicht layout)
     3. Builds wheels via pip (local forks take priority over git URLs)
     4. Returns a mapping of package_name -> version for toml rewriting
 
@@ -566,6 +567,21 @@ def _find_wheel_for_package(pkg_name: str) -> Path | None:
     return None
 
 
+def _normalize_git_remote_url(remote: str) -> str:
+    """Normalize common git remote URL formats to HTTPS links."""
+    remote = remote.strip()
+    if remote.startswith("git@github.com:"):
+        remote = remote.replace("git@github.com:", "https://github.com/", 1)
+    elif remote.startswith("ssh://git@github.com/"):
+        remote = remote.replace(
+            "ssh://git@github.com/", "https://github.com/", 1
+        )
+
+    if remote.endswith(".git"):
+        remote = remote[:-4]
+    return remote
+
+
 def _write_engine_commits(omlx_pkg_dir: Path):
     """Write _engine_commits.json to the omlx package for runtime SHA display.
 
@@ -606,7 +622,15 @@ def _write_engine_commits(omlx_pkg_dir: Path):
             if result.returncode == 0:
                 commit = result.stdout.strip()
                 entry = {"commit": commit, "local_fork": True}
-                if name in repo_urls:
+                remote_result = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=path, capture_output=True, text=True,
+                )
+                if remote_result.returncode == 0:
+                    entry["url"] = _normalize_git_remote_url(
+                        remote_result.stdout.strip()
+                    )
+                elif name in repo_urls:
                     entry["url"] = repo_urls[name]
                 commits[name] = entry
         except Exception:
@@ -781,8 +805,8 @@ def build_venvstacks():
     # the code-signed app bundle (read-only site-packages).
     _install_spacy_model(EXPORT_DIR)
 
-    # Strip large packages that are only needed for model conversion / data
-    # loading, not inference. Saves ~780 MB in the app bundle.
+    # Strip large packages that are only needed for model conversion, not
+    # inference or packaged benchmarking.
     _strip_unused_packages(EXPORT_DIR)
 
     return EXPORT_DIR
@@ -874,22 +898,21 @@ def _install_spacy_model(export_dir: Path):
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
-# pulled in by modelscope (datasets→pyarrow/pandas) and mlx-vlm (opencv)
-# but are NOT needed for inference at runtime. torch/sympy kept as safety
-# net in case any future dependency pulls them in transitively.
+# pulled in by mlx-vlm (opencv) or optional torch extras that are not needed
+# for the default packaged inference/runtime path.
+#
+# Keep datasets/pandas/pyarrow in the packaged runtime: they are required for
+# MTEB benchmarking that the root Makefile now runs against the packaged app.
 _STRIP_PACKAGES = [
     "torch",
     "sympy",           # torch dep (safety net)
     "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
-    "pyarrow",         # datasets dep
-    "pandas",          # datasets dep
-    "datasets",        # modelscope dep, not used at inference
     # dist-info dirs (matched by prefix)
 ]
 
 # Prefixes for dist-info directories to remove alongside the packages above.
 _STRIP_DIST_PREFIXES = [
-    "torch-", "sympy-", "opencv_python-", "pyarrow-", "pandas-", "datasets-",
+    "torch-", "sympy-", "opencv_python-",
 ]
 
 

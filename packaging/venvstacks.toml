@@ -101,6 +101,8 @@ requirements = [
     "pyobjc-framework-Cocoa>=10.0",
     # Grammar-constrained decoding for structured output
     "xgrammar>=0.1.32",
+    # Packaged benchmark runtime used by root Makefile embed-mteb target
+    "mteb>=2.12.16,<3.0.0",
 ]
 platforms = [
     "macosx_arm64",
