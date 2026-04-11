@@ -73,6 +73,33 @@ def _read_version() -> str:
 VERSION = _read_version()
 
 
+def _remove_path_native(path: Path):
+    """Remove a file or directory with macOS rm.
+
+    Python's shutil can fail on com.apple.provenance-tagged files inside the
+    packaged environments, while the native tool handles them correctly.
+    """
+    if not path.exists() and not path.is_symlink():
+        return
+    subprocess.run(["rm", "-rf", str(path)], check=True)
+
+
+def _copy_tree_native(src: Path, dst: Path):
+    """Copy a directory tree with macOS cp.
+
+    This avoids shutil.copytree/copy2 failures when the source carries macOS
+    provenance metadata.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["cp", "-R", str(src), str(dst)], check=True)
+
+
+def _copy_file_native(src: Path, dst: Path):
+    """Copy a single file with macOS cp to avoid shutil xattr failures."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["cp", str(src), str(dst)], check=True)
+
+
 def clean_all(preserve_venv: bool = False):
     """Remove build artifacts and caches for a clean build.
 
@@ -108,7 +135,7 @@ def clean_all(preserve_venv: bool = False):
         if preserve_venv and d in venv_dirs:
             continue
         if d.exists():
-            shutil.rmtree(d, onerror=_rm_onerror)
+            _remove_path_native(d)
             print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
 
     for f in files_to_clean:
@@ -1072,14 +1099,18 @@ def create_app_bundle():
     print("\n[2/4] Creating app bundle...")
 
     app_dir = DIST_DIR / APP_BUNDLE
-    contents_dir = app_dir / "Contents"
+    staging_dir = DIST_DIR / "_app_bundle_staging"
+    contents_dir = staging_dir / "Contents"
     macos_dir = contents_dir / "MacOS"
     resources_dir = contents_dir / "Resources"
     frameworks_dir = contents_dir / "Frameworks"
 
-    # Clean and create directories
+    # Clean and create directories. The exported Python layers carry macOS
+    # provenance metadata that shutil.copytree/copy2 cannot reliably copy.
     if app_dir.exists():
-        shutil.rmtree(app_dir)
+        _remove_path_native(app_dir)
+    if staging_dir.exists():
+        _remove_path_native(staging_dir)
 
     macos_dir.mkdir(parents=True)
     resources_dir.mkdir(parents=True)
@@ -1091,13 +1122,13 @@ def create_app_bundle():
         src = EXPORT_DIR / layer
         if src.exists():
             dst = frameworks_dir / layer
-            shutil.copytree(src, dst, symlinks=True)
+            _copy_tree_native(src, dst)
             print(f"    Copied {layer}")
 
     # Copy venvstacks metadata
     venvstacks_meta = EXPORT_DIR / "__venvstacks__"
     if venvstacks_meta.exists():
-        shutil.copytree(venvstacks_meta, frameworks_dir / "__venvstacks__", symlinks=True)
+        _copy_tree_native(venvstacks_meta, frameworks_dir / "__venvstacks__")
 
     # Copy omlx_app to Resources
     print("  Copying omlx_app...")
@@ -1138,7 +1169,7 @@ def create_app_bundle():
     print("  Copying Python runtime into MacOS/...")
     src_python = frameworks_dir / "cpython-3.12" / "bin" / "python3"
     dst_python = macos_dir / "python3"
-    shutil.copy2(src_python, dst_python)
+    _copy_file_native(src_python, dst_python)
     dst_python.chmod(0o755)
 
     # Python binary references @executable_path/../lib/libpython3.12.dylib
@@ -1195,6 +1226,7 @@ def create_app_bundle():
     # Create placeholder icon
     create_placeholder_icon(resources_dir)
 
+    staging_dir.rename(app_dir)
     print(f"  ✓ Created {app_dir}")
     return app_dir
 
@@ -1387,7 +1419,7 @@ def sign_app(app_dir: Path):
         # Remove the broken _CodeSignature so macOS doesn't show "damaged" error.
         codesig = app_dir / "Contents" / "_CodeSignature"
         if codesig.exists():
-            shutil.rmtree(codesig)
+            _remove_path_native(codesig)
         print("  ⚠ Deep signing failed (expected for dev builds), running unsigned")
     else:
         print(f"  ✓ Signed {app_dir}")
@@ -1404,13 +1436,16 @@ def create_dmg(app_dir: Path):
     if dmg_path.exists():
         dmg_path.unlink()
     if dmg_staging.exists():
-        shutil.rmtree(dmg_staging)
+        _remove_path_native(dmg_staging)
 
     # Create staging directory
     dmg_staging.mkdir(parents=True)
 
-    # Copy app bundle to staging
-    shutil.copytree(app_dir, dmg_staging / APP_BUNDLE, symlinks=True)
+    # Copy to a neutral name first, then rename to .app to avoid bundle-path
+    # provenance restrictions during the copy step.
+    dmg_app_staging = dmg_staging / "_app_copy"
+    _copy_tree_native(app_dir, dmg_app_staging)
+    dmg_app_staging.rename(dmg_staging / APP_BUNDLE)
 
     # Create Applications symlink
     applications_link = dmg_staging / "Applications"
@@ -1426,7 +1461,7 @@ def create_dmg(app_dir: Path):
     ])
 
     # Cleanup staging
-    shutil.rmtree(dmg_staging)
+    _remove_path_native(dmg_staging)
 
     print(f"  ✓ Created {dmg_path}")
     return dmg_path
